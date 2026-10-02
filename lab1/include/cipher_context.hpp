@@ -14,7 +14,7 @@ namespace lab1 {
 
 enum class cipher_mode { ecb, cbc, pcbc, cfb, ofb, ctr, random_delta };
 
-enum class padding_mode { zeros, ansi_x923m, pkcs7, iso_10126 };
+enum class padding_mode { zeros, ansi_x923, pkcs7, iso_10126 };
 
 // Класс, репрезентирующий контекст выполнения симметричного криптографического
 // алгоритма, предоставляющий объектный функционал по выполнению операций

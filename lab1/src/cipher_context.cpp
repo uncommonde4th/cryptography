@@ -10,6 +10,7 @@
 #include <random>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 namespace lab1 {
@@ -90,7 +91,7 @@ bytes pad(bytes_view data, std::size_t bs, padding_mode mode) {
   }
   const std::size_t count = bs - rest;
   switch (mode) {
-    case padding_mode::ansi_x923m:
+    case padding_mode::ansi_x923:
       result.insert(result.end(), count - 1, std::uint8_t{0});
       break;
     case padding_mode::pkcs7:
@@ -180,7 +181,8 @@ cipher_context::cipher_context(std::unique_ptr<i_block_cipher> cipher,
 
   block_size_ = cipher_->block_size();
   if (block_size_ == 0 || block_size_ > 255) {
-    throw std::invalid_argument("cipher_context: unsupported block size");
+    throw std::invalid_argument("cipher_context: unsupported block size: " +
+                                std::to_string(block_size_));
   }
 
   if (mode_ != cipher_mode::ecb) {
