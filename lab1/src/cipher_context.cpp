@@ -24,10 +24,10 @@ constexpr std::size_t parallel_threshold = 256;
 
 // Шаблон для параллельного выполнения лямбда-функций.
 template <typename F>
-void parallel_for(std::size_t count, F&& fn) {
+std::size_t parallel_for(std::size_t count, F&& fn) {
   if (count < parallel_threshold) {
     fn(std::size_t{0}, count);
-    return;
+    return 1;
   }
   const std::size_t workers = std::max<std::size_t>(
       1, std::min<std::size_t>(std::thread::hardware_concurrency(), count));
@@ -46,6 +46,7 @@ void parallel_for(std::size_t count, F&& fn) {
   for (auto& task : tasks) {
     task.get();
   }
+  return tasks.size();
 }
 
 bytes xor_bytes(bytes_view a, bytes_view b) {
@@ -202,7 +203,10 @@ cipher_context::cipher_context(std::unique_ptr<i_block_cipher> cipher,
 }
 
 cipher_context::bytes cipher_context::encrypt_sync(bytes_view data) const {
-  return encrypt_blocks(pad(data, block_size_, padding_));
+  std::size_t threads = 1;
+  bytes result = encrypt_blocks(pad(data, block_size_, padding_), threads);
+  encrypt_threads_ = threads;
+  return result;
 }
 
 cipher_context::bytes cipher_context::decrypt_sync(bytes_view data) const {
@@ -210,25 +214,34 @@ cipher_context::bytes cipher_context::decrypt_sync(bytes_view data) const {
     throw std::invalid_argument(
         "decrypt: data size is not a multiple of block size");
   }
-  const bytes plain = decrypt_blocks(bytes(data.begin(), data.end()));
+  std::size_t threads = 1;
+  const bytes plain = decrypt_blocks(bytes(data.begin(), data.end()), threads);
+  decrypt_threads_ = threads;
   return unpad(plain, block_size_, padding_);
 }
 
-cipher_context::bytes cipher_context::stream_blocks(const bytes& in) const {
+cipher_context::bytes cipher_context::stream_blocks(
+    const bytes& in, std::size_t& threads) const {
   const std::size_t bs = block_size_;
   const std::size_t n = in.size() / bs;
   bytes out(in.size());
 
   if (mode_ == cipher_mode::ofb) {
+    threads = 1;
     bytes state = iv_;
     for (std::size_t i = 0; i < n; ++i) {
       state = cipher_->encrypt_block(state);
       store_block(out, i, bs, xor_bytes(block_view(in, i, bs), state));
     }
   } else {
-    parallel_for(n, [&](std::size_t begin, std::size_t end) {
+    // CTR - частный случай Random Delta при delta = 1:
+    // C_i = P_i xor E(IV + i * Delta). Блоки независимы.
+    const std::uint64_t step = mode_ == cipher_mode::random_delta ? delta_ : 1;
+    threads = parallel_for(n, [&](std::size_t begin, std::size_t end) {
       for (std::size_t i = begin; i < end; ++i) {
-        const bytes gamma = cipher_->encrypt_block(make_counter(iv_, i));
+        const bytes counter =
+            make_counter(iv_, static_cast<std::uint64_t>(i) * step);
+        const bytes gamma = cipher_->encrypt_block(counter);
         store_block(out, i, bs, xor_bytes(block_view(in, i, bs), gamma));
       }
     });
@@ -236,22 +249,24 @@ cipher_context::bytes cipher_context::stream_blocks(const bytes& in) const {
   return out;
 }
 
-cipher_context::bytes cipher_context::encrypt_blocks(const bytes& plain) const {
+cipher_context::bytes cipher_context::encrypt_blocks(
+    const bytes& plain, std::size_t& threads) const {
   const std::size_t bs = block_size_;
   const std::size_t n = plain.size() / bs;
   bytes out(plain.size());
+  threads = 1;
 
   switch (mode_) {
-    case cipher_mode::ecb: {
-      parallel_for(n, [&](std::size_t begin, std::size_t end) {
+    case cipher_mode::ecb:
+      threads = parallel_for(n, [&](std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end; ++i) {
           store_block(out, i, bs,
                       cipher_->encrypt_block(block_view(plain, i, bs)));
         }
       });
       break;
-    }
-    case cipher_mode::cbc: {
+
+    case cipher_mode::cbc: {  // C_i = E(P_i xor C_(i-1)), C_0 = IV
       bytes prev = iv_;
       for (std::size_t i = 0; i < n; ++i) {
         bytes c =
@@ -261,7 +276,9 @@ cipher_context::bytes cipher_context::encrypt_blocks(const bytes& plain) const {
       }
       break;
     }
-    case cipher_mode::pcbc: {
+
+    case cipher_mode::
+        pcbc: {  // C_i = E(P_i xor F_(i-1)), F_i = P_i xor C_i, F_0 = IV
       bytes feedback = iv_;
       for (std::size_t i = 0; i < n; ++i) {
         const bytes c = cipher_->encrypt_block(
@@ -272,7 +289,7 @@ cipher_context::bytes cipher_context::encrypt_blocks(const bytes& plain) const {
       break;
     }
 
-    case cipher_mode::cfb: {
+    case cipher_mode::cfb: {  // C_i = P_i xor E(C_(i-1)), C_0 = IV
       bytes prev = iv_;
       for (std::size_t i = 0; i < n; ++i) {
         bytes c =
@@ -285,43 +302,31 @@ cipher_context::bytes cipher_context::encrypt_blocks(const bytes& plain) const {
 
     case cipher_mode::ofb:
     case cipher_mode::ctr:
-      return stream_blocks(plain);
-
-    case cipher_mode::random_delta: {
-      parallel_for(n, [&](std::size_t begin, std::size_t end) {
-        for (std::size_t i = begin; i < end; ++i) {
-          const bytes value =
-              make_counter(iv_, static_cast<std::uint64_t>(i) * delta_);
-          store_block(out, i, bs,
-                      cipher_->encrypt_block(
-                          xor_bytes(block_view(plain, i, bs), value)));
-        }
-      });
-      break;
-    }
+    case cipher_mode::random_delta:
+      return stream_blocks(plain, threads);
   }
   return out;
 }
 
 cipher_context::bytes cipher_context::decrypt_blocks(
-    const bytes& cipher_text) const {
+    const bytes& cipher_text, std::size_t& threads) const {
   const std::size_t bs = block_size_;
   const std::size_t n = cipher_text.size() / bs;
   bytes out(cipher_text.size());
+  threads = 1;
 
   switch (mode_) {
-    case cipher_mode::ecb: {
-      parallel_for(n, [&](std::size_t begin, std::size_t end) {
+    case cipher_mode::ecb:
+      threads = parallel_for(n, [&](std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end; ++i) {
           store_block(out, i, bs,
                       cipher_->decrypt_block(block_view(cipher_text, i, bs)));
         }
       });
       break;
-    }
 
-    case cipher_mode::cbc: {
-      parallel_for(n, [&](std::size_t begin, std::size_t end) {
+    case cipher_mode::cbc:  // P_i = D(C_i) xor C_(i-1); блоки независимы
+      threads = parallel_for(n, [&](std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end; ++i) {
           const bytes_view prev =
               i == 0 ? bytes_view(iv_) : block_view(cipher_text, i - 1, bs);
@@ -332,9 +337,8 @@ cipher_context::bytes cipher_context::decrypt_blocks(
         }
       });
       break;
-    }
 
-    case cipher_mode::pcbc: {
+    case cipher_mode::pcbc: {  // P_i = D(C_i) xor F_(i-1), F_i = P_i xor C_i
       bytes feedback = iv_;
       for (std::size_t i = 0; i < n; ++i) {
         const bytes p = xor_bytes(
@@ -345,8 +349,8 @@ cipher_context::bytes cipher_context::decrypt_blocks(
       break;
     }
 
-    case cipher_mode::cfb: {
-      parallel_for(n, [&](std::size_t begin, std::size_t end) {
+    case cipher_mode::cfb:  // P_i = C_i xor E(C_(i-1)); блоки независимы
+      threads = parallel_for(n, [&](std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end; ++i) {
           const bytes_view prev =
               i == 0 ? bytes_view(iv_) : block_view(cipher_text, i - 1, bs);
@@ -356,25 +360,11 @@ cipher_context::bytes cipher_context::decrypt_blocks(
         }
       });
       break;
-    }
 
     case cipher_mode::ofb:
     case cipher_mode::ctr:
-      return stream_blocks(cipher_text);
-
-    case cipher_mode::random_delta: {
-      parallel_for(n, [&](std::size_t begin, std::size_t end) {
-        for (std::size_t i = begin; i < end; ++i) {
-          const bytes value =
-              make_counter(iv_, static_cast<std::uint64_t>(i) * delta_);
-          store_block(
-              out, i, bs,
-              xor_bytes(cipher_->decrypt_block(block_view(cipher_text, i, bs)),
-                        value));
-        }
-      });
-      break;
-    }
+    case cipher_mode::random_delta:
+      return stream_blocks(cipher_text, threads);
   }
   return out;
 }

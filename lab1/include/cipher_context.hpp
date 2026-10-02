@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -42,15 +43,24 @@ class cipher_context {
   [[nodiscard]] std::future<void> decrypt(const std::filesystem::path& input,
                                           const std::filesystem::path& output);
 
+  /// Сколько потоков считало блоки в последней завершённой операции
+  /// (1 - последовательное вычисление). Читать после future::get().
+  [[nodiscard]] std::size_t last_encrypt_threads() const noexcept {
+    return encrypt_threads_.load();
+  }
+  [[nodiscard]] std::size_t last_decrypt_threads() const noexcept {
+    return decrypt_threads_.load();
+  }
+
  private:
   using bytes = std::vector<std::uint8_t>;
 
   bytes encrypt_sync(std::span<const std::uint8_t> data) const;
   bytes decrypt_sync(std::span<const std::uint8_t> data) const;
 
-  bytes encrypt_blocks(const bytes& plain) const;
-  bytes decrypt_blocks(const bytes& cipher_text) const;
-  bytes stream_blocks(const bytes& in) const;
+  bytes encrypt_blocks(const bytes& plain, std::size_t& threads) const;
+  bytes decrypt_blocks(const bytes& cipher_text, std::size_t& threads) const;
+  bytes stream_blocks(const bytes& in, std::size_t& threads) const;
 
   std::unique_ptr<i_block_cipher> cipher_;
   cipher_mode mode_;
@@ -58,5 +68,7 @@ class cipher_context {
   std::size_t block_size_ = 0;
   bytes iv_;
   std::uint64_t delta_ = 0;
+  mutable std::atomic<std::size_t> encrypt_threads_{1};
+  mutable std::atomic<std::size_t> decrypt_threads_{1};
 };
 }  // namespace lab1

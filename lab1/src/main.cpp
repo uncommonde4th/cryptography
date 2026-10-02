@@ -181,14 +181,20 @@ bool file_test(const algorithm& algo, const std::filesystem::path& path,
 
   std::printf("  файл %s (%zu байт)\n", path.string().c_str(), original.size());
   bool all_ok = true;
+  std::printf("Доступно аппаратных потоков: %u\n",
+              std::thread::hardware_concurrency());
   for (const auto& mode : all_modes) {
     bool ok = false;
     double seconds = 0;
+    std::size_t encrypt_threads = 0;
+    std::size_t decrypt_threads = 0;
     try {
       auto ctx = make_context(algo, key, mode.mode, padding_mode::pkcs7, iv);
       const auto start = std::chrono::steady_clock::now();
       ctx->encrypt(path, encrypted_path).get();
+      encrypt_threads = ctx->last_encrypt_threads();
       ctx->decrypt(encrypted_path, decrypted_path).get();
+      decrypt_threads = ctx->last_decrypt_threads();
       seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                               start)
                     .count();
@@ -196,8 +202,10 @@ bool file_test(const algorithm& algo, const std::filesystem::path& path,
     } catch (const std::exception& e) {
       std::printf("    исключение: %s\n", e.what());
     }
-    std::printf("    %-12s %s  (%.3f с)\n", mode.name, ok ? "OK" : "FAIL",
-                seconds);
+    std::printf(
+        "    %-12s %s  (%.3f с)  потоков: шифрование %zu, дешифрование %zu\n",
+        mode.name, ok ? "OK" : "FAIL", seconds, encrypt_threads,
+        decrypt_threads);
     all_ok = all_ok && ok;
   }
 
