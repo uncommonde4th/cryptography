@@ -12,6 +12,7 @@ set(PROJECT_SOURCES
     src/cipher_context.cpp
     src/feistel_network.cpp
     src/des.cpp
+    src/deal.cpp
 )
 
 find_package(Threads REQUIRED)
