@@ -14,7 +14,7 @@
 
 namespace lab1 {
 
-// Расширение ключа DEAL: ключ 16, 24 или 32 байта -> 6 или 8 раундовых ключей по 8 байт.
+// Расширение ключа DEAL: ключ 16, 24 или 32 байта => 6 или 8 раундовых ключей по 8 байт.
 class deal_key_expander final : public i_key_expander {
  public:
   [[nodiscard]] std::vector<std::vector<std::uint8_t>> expand_key(
@@ -22,7 +22,6 @@ class deal_key_expander final : public i_key_expander {
 };
 
 // Адаптер: использует блочный шифр (DES) в качестве раундовой функции F.
-// F(блок, раундовый_ключ) = шифрование блока на раундовом ключе.
 class des_round_adapter final : public i_round_transform {
  public:
   using cipher_factory = std::function<std::unique_ptr<i_block_cipher>()>;

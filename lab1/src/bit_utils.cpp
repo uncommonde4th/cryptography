@@ -34,7 +34,7 @@ void set_bit(std::span<std::uint8_t> data, std::size_t k, bool bit,
   }
 }
 
-// Переставляет биты по P-блоку. Размер результата зависит от размера P-блока.
+// Переставляет биты по P-блоку
 std::vector<std::uint8_t> permute(std::span<const std::uint8_t> value,
                                   std::span<const std::size_t> p_block,
                                   bit_order order, std::size_t base_index) {

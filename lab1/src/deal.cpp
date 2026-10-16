@@ -38,7 +38,7 @@ std::vector<bytes> deal_key_expander::expand_key(
     throw std::invalid_argument("DEAL key must be 16, 24 or 32 bytes");
   }
 
-  const std::size_t parts = key.size() / 8;  // k: число 64-битных частей ключа
+  const std::size_t parts = key.size() / 8;  // k число 64-битных частей ключа
   const std::size_t rounds =
       parts == 4 ? 8 : 6;  // 6 раундов для 128/192, 8 для 256
 
@@ -46,8 +46,8 @@ std::vector<bytes> deal_key_expander::expand_key(
   cipher.set_key(fixed_des_key);
 
   // RK_1 = E(K_1)
-  // RK_i = E(K_i xor RK_(i-1))                      при 1 < i <= k
-  // RK_i = E(K_((i-1) mod k + 1) xor s_(i-k) xor RK_(i-1))   при i > k
+  // RK_i = E(K_i xor RK_(i-1)) при 1 < i <= k
+  // RK_i = E(K_((i-1) mod k + 1) xor s_(i-k) xor RK_(i-1)) при i > k
   std::vector<bytes> round_keys;
   round_keys.reserve(rounds);
   for (std::size_t i = 1; i <= rounds; ++i) {

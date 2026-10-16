@@ -43,8 +43,6 @@ class cipher_context {
   [[nodiscard]] std::future<void> decrypt(const std::filesystem::path& input,
                                           const std::filesystem::path& output);
 
-  /// Сколько потоков считало блоки в последней завершённой операции
-  /// (1 - последовательное вычисление). Читать после future::get().
   [[nodiscard]] std::size_t last_encrypt_threads() const noexcept {
     return encrypt_threads_.load();
   }
