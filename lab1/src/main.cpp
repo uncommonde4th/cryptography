@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -85,6 +86,30 @@ bytes read_all(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
   return bytes(std::istreambuf_iterator<char>(in),
                std::istreambuf_iterator<char>());
+}
+
+bool files_equal(const std::filesystem::path& a,
+                 const std::filesystem::path& b) {
+  std::ifstream fa(a, std::ios::binary);
+  std::ifstream fb(b, std::ios::binary);
+  if (!fa || !fb) {
+    return false;
+  }
+  std::array<char, 4096> buf_a{};
+  std::array<char, 4096> buf_b{};
+  while (true) {
+    fa.read(buf_a.data(), buf_a.size());
+    fb.read(buf_b.data(), buf_b.size());
+    const auto got_a = fa.gcount();
+    const auto got_b = fb.gcount();
+    if (got_a != got_b ||
+        !std::equal(buf_a.begin(), buf_a.begin() + got_a, buf_b.begin())) {
+      return false;
+    }
+    if (got_a == 0) {
+      return true;
+    }
+  }
 }
 
 std::vector<named_padding> select_paddings(const std::string& filter,
@@ -187,6 +212,52 @@ bool random_data_test(const algorithm& algo, std::mt19937_64& rng,
   return passed == total;
 }
 
+bool streaming_consistency_test(const algorithm& algo, std::mt19937_64& rng) {
+  const std::array<std::size_t, 6> sizes = {0, 1, 4095, 4096, 4097, 8193};
+  const auto tmp = std::filesystem::temp_directory_path();
+  const auto in_path = tmp / "lab1_stream.in";
+  const auto enc_path = tmp / "lab1_stream.enc";
+  const auto dec_path = tmp / "lab1_stream.dec";
+  bool all_ok = true;
+
+  for (std::size_t size : sizes) {
+    const bytes data = random_bytes(rng, size);
+    {
+      std::ofstream out(in_path, std::ios::binary | std::ios::trunc);
+      out.write(reinterpret_cast<const char*>(data.data()),
+                static_cast<std::streamsize>(data.size()));
+    }
+    for (const auto& mode : all_modes) {
+      const bytes key = random_bytes(rng, algo.key_size);
+      const bytes iv = random_bytes(rng, algo.block_size);
+      bool ok = false;
+      try {
+        auto ctx = make_context(algo, key, mode.mode, padding_mode::pkcs7, iv);
+        bytes expected;
+        ctx->encrypt(data, expected).get();
+        ctx->encrypt(in_path, enc_path).get();
+        ctx->decrypt(enc_path, dec_path).get();
+        ok = read_all(enc_path) == expected && files_equal(in_path, dec_path);
+      } catch (const std::exception& e) {
+        std::printf("  исключение: %s\n", e.what());
+      }
+      if (!ok) {
+        std::printf("  FAIL (потоковая обработка): размер %zu, режим %s\n",
+                    size, mode.name);
+        all_ok = false;
+      }
+    }
+  }
+
+  std::error_code ignored;
+  /*std::filesystem::remove(in_path, ignored);
+  std::filesystem::remove(enc_path, ignored);
+  std::filesystem::remove(dec_path, ignored);*/
+  std::printf("  потоковая обработка (границы порций): %s\n",
+              all_ok ? "OK" : "FAIL");
+  return all_ok;
+}
+
 bool file_test(const algorithm& algo, const std::filesystem::path& path,
                const named_padding& pad, std::mt19937_64& rng) {
   const bytes key = random_bytes(rng, algo.key_size);
@@ -194,10 +265,10 @@ bool file_test(const algorithm& algo, const std::filesystem::path& path,
   const auto tmp = std::filesystem::temp_directory_path();
   const auto encrypted_path = tmp / "lab1_demo.enc";
   const auto decrypted_path = tmp / "lab1_demo.dec";
-  const bytes original = read_all(path);
 
-  std::printf("  файл %s (%zu байт), набивка %s\n", path.string().c_str(),
-              original.size(), pad.name);
+  std::printf("  файл %s (%llu байт), набивка %s\n", path.string().c_str(),
+              static_cast<unsigned long long>(std::filesystem::file_size(path)),
+              pad.name);
   bool all_ok = true;
   for (const auto& mode : all_modes) {
     bool ok = false;
@@ -214,7 +285,7 @@ bool file_test(const algorithm& algo, const std::filesystem::path& path,
       seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                               start)
                     .count();
-      ok = read_all(decrypted_path) == original;
+      ok = files_equal(path, decrypted_path);
     } catch (const std::exception& e) {
       std::printf("    исключение: %s\n", e.what());
     }
@@ -273,6 +344,7 @@ int main(int argc, char* argv[]) {
       std::printf("\n=== %s ===\n", algo.name);
       ok = block_roundtrip_test(algo, rng) && ok;
       ok = random_data_test(algo, rng, test_paddings) && ok;
+      ok = streaming_consistency_test(algo, rng) && ok;
       for (const auto& file : files) {
         for (const auto& pad : file_paddings) {
           ok = file_test(algo, file, pad, rng) && ok;

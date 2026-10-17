@@ -1,16 +1,9 @@
 #include "cipher_context.hpp"
 
 #include <algorithm>
-#include <cstddef>
-#include <filesystem>
 #include <fstream>
-#include <future>
-#include <ios>
-#include <memory>
 #include <random>
-#include <span>
 #include <stdexcept>
-#include <string>
 #include <thread>
 
 namespace lab1 {
@@ -20,9 +13,11 @@ namespace {
 using bytes = std::vector<std::uint8_t>;
 using bytes_view = std::span<const std::uint8_t>;
 
-constexpr std::size_t parallel_threshold = 256;
+constexpr std::size_t parallel_threshold =
+    256;  // меньше блоков - считаем в одном потоке
+constexpr std::size_t file_buffer_size =
+    4096;  // размер порции при работе с файлами
 
-// Шаблон для параллельного выполнения лямбда-функций.
 template <typename F>
 std::size_t parallel_for(std::size_t count, F&& fn) {
   if (count < parallel_threshold) {
@@ -66,6 +61,7 @@ void store_block(bytes& out, std::size_t i, std::size_t bs,
   std::copy(block.begin(), block.end(), out.data() + i * bs);
 }
 
+/// iv + offset (big-endian, по модулю 2^(8 * размер iv)).
 bytes make_counter(bytes_view iv, std::uint64_t offset) {
   bytes counter(iv.begin(), iv.end());
   unsigned int carry = 0;
@@ -90,7 +86,9 @@ bytes pad(bytes_view data, std::size_t bs, padding_mode mode) {
     }
     return result;
   }
-  const std::size_t count = bs - rest;
+
+  const std::size_t count =
+      bs - rest;  // от 1 до bs; если данные кратны bs, добавляется целый блок
   switch (mode) {
     case padding_mode::ansi_x923:
       result.insert(result.end(), count - 1, std::uint8_t{0});
@@ -135,36 +133,17 @@ bytes unpad(bytes data, std::size_t bs, padding_mode mode) {
         throw std::runtime_error("unpad: invalid PKCS7 padding");
       }
     }
+  } else if (mode == padding_mode::ansi_x923) {
+    for (std::size_t i = start; i + 1 < data.size(); ++i) {
+      if (data[i] != 0) {
+        throw std::runtime_error("unpad: invalid ANSI X.923 padding");
+      }
+    }
   }
+  // ISO 10126: случайные байты не проверяются, важен только последний.
+
   data.resize(start);
   return data;
-}
-
-bytes read_file(const std::filesystem::path& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    throw std::runtime_error("cannot open input file: " + path.string());
-  }
-  const auto size =
-      static_cast<std::streamsize>(std::filesystem::file_size(path));
-  bytes data(static_cast<std::size_t>(size));
-  in.read(reinterpret_cast<char*>(data.data()), size);
-  if (in.gcount() != size) {
-    throw std::runtime_error("cannot read input file: " + path.string());
-  }
-  return data;
-}
-
-void write_file(const std::filesystem::path& path, const bytes& data) {
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out) {
-    throw std::runtime_error("cannot open output file: " + path.string());
-  }
-  out.write(reinterpret_cast<const char*>(data.data()),
-            static_cast<std::streamsize>(data.size()));
-  if (!out) {
-    throw std::runtime_error("cannot write output file: " + path.string());
-  }
 }
 
 }  // namespace
@@ -182,8 +161,7 @@ cipher_context::cipher_context(std::unique_ptr<i_block_cipher> cipher,
 
   block_size_ = cipher_->block_size();
   if (block_size_ == 0 || block_size_ > 255) {
-    throw std::invalid_argument("cipher_context: unsupported block size: " +
-                                std::to_string(block_size_));
+    throw std::invalid_argument("cipher_context: unsupported block size");
   }
 
   if (mode_ != cipher_mode::ecb) {
@@ -193,7 +171,8 @@ cipher_context::cipher_context(std::unique_ptr<i_block_cipher> cipher,
     }
     iv_ = std::move(*iv);
   }
-  if (mode == cipher_mode::random_delta) {
+
+  if (mode_ == cipher_mode::random_delta) {
     if (extra_params.empty()) {
       throw std::invalid_argument(
           "cipher_context: random_delta requires delta");
@@ -202,9 +181,17 @@ cipher_context::cipher_context(std::unique_ptr<i_block_cipher> cipher,
   }
 }
 
+cipher_context::stream_state cipher_context::initial_state() const {
+  stream_state state;
+  state.prev = iv_;  // для ECB пусто
+  return state;
+}
+
 cipher_context::bytes cipher_context::encrypt_sync(bytes_view data) const {
+  stream_state state = initial_state();
   std::size_t threads = 1;
-  bytes result = encrypt_blocks(pad(data, block_size_, padding_), threads);
+  bytes result =
+      encrypt_blocks(pad(data, block_size_, padding_), state, threads);
   encrypt_threads_ = threads;
   return result;
 }
@@ -214,43 +201,116 @@ cipher_context::bytes cipher_context::decrypt_sync(bytes_view data) const {
     throw std::invalid_argument(
         "decrypt: data size is not a multiple of block size");
   }
+  stream_state state = initial_state();
   std::size_t threads = 1;
-  const bytes plain = decrypt_blocks(bytes(data.begin(), data.end()), threads);
+  bytes plain = decrypt_blocks(bytes(data.begin(), data.end()), state, threads);
   decrypt_threads_ = threads;
-  return unpad(plain, block_size_, padding_);
+  return unpad(std::move(plain), block_size_, padding_);
+}
+
+void cipher_context::process_file(const std::filesystem::path& input,
+                                  const std::filesystem::path& output,
+                                  bool encrypting) const {
+  if (std::filesystem::exists(output) && std::filesystem::exists(input) &&
+      std::filesystem::equivalent(input, output)) {
+    throw std::invalid_argument("input and output files must be different");
+  }
+
+  std::ifstream in(input, std::ios::binary);
+  if (!in) {
+    throw std::runtime_error("cannot open input file: " + input.string());
+  }
+  std::ofstream out(output, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    throw std::runtime_error("cannot open output file: " + output.string());
+  }
+
+  // Размер порции кратен размеру блока (4096 для блоков 8 и 16 байт).
+  const std::size_t chunk_size =
+      std::max(block_size_, (file_buffer_size / block_size_) * block_size_);
+  bytes buffer(chunk_size);
+  stream_state state = initial_state();
+  std::size_t max_threads = 1;
+
+  while (true) {
+    in.read(reinterpret_cast<char*>(buffer.data()),
+            static_cast<std::streamsize>(chunk_size));
+    const auto got = static_cast<std::size_t>(in.gcount());
+    const bool last = in.peek() == std::ifstream::traits_type::eof();
+
+    const bytes_view chunk(buffer.data(), got);
+    std::size_t threads = 1;
+    bytes result;
+    if (encrypting) {
+      // Набивка добавляется только к последней порции.
+      const bytes plain = last ? pad(chunk, block_size_, padding_)
+                               : bytes(chunk.begin(), chunk.end());
+      result = encrypt_blocks(plain, state, threads);
+    } else {
+      if (got % block_size_ != 0) {
+        throw std::invalid_argument(
+            "decrypt: file size is not a multiple of block size");
+      }
+      result =
+          decrypt_blocks(bytes(chunk.begin(), chunk.end()), state, threads);
+      if (last) {
+        result = unpad(std::move(result), block_size_, padding_);
+      }
+    }
+
+    out.write(reinterpret_cast<const char*>(result.data()),
+              static_cast<std::streamsize>(result.size()));
+    max_threads = std::max(max_threads, threads);
+
+    if (last) {
+      break;
+    }
+  }
+
+  if (in.bad()) {
+    throw std::runtime_error("cannot read input file: " + input.string());
+  }
+  out.flush();
+  if (!out) {
+    throw std::runtime_error("cannot write output file: " + output.string());
+  }
+  (encrypting ? encrypt_threads_ : decrypt_threads_) = max_threads;
 }
 
 cipher_context::bytes cipher_context::stream_blocks(
-    const bytes& in, std::size_t& threads) const {
+    const bytes& in, stream_state& state, std::size_t& threads) const {
   const std::size_t bs = block_size_;
   const std::size_t n = in.size() / bs;
   bytes out(in.size());
 
   if (mode_ == cipher_mode::ofb) {
     threads = 1;
-    bytes state = iv_;
+    bytes gamma = state.prev;
     for (std::size_t i = 0; i < n; ++i) {
-      state = cipher_->encrypt_block(state);
-      store_block(out, i, bs, xor_bytes(block_view(in, i, bs), state));
+      gamma = cipher_->encrypt_block(gamma);
+      store_block(out, i, bs, xor_bytes(block_view(in, i, bs), gamma));
     }
+    state.prev = std::move(gamma);
   } else {
     // CTR - частный случай Random Delta при delta = 1:
-    // C_i = P_i xor E(IV + i * Delta). Блоки независимы.
+    // C_i = P_i xor E(IV + i * step). Блоки независимы.
     const std::uint64_t step = mode_ == cipher_mode::random_delta ? delta_ : 1;
+    const std::uint64_t base = state.block_index;
     threads = parallel_for(n, [&](std::size_t begin, std::size_t end) {
       for (std::size_t i = begin; i < end; ++i) {
         const bytes counter =
-            make_counter(iv_, static_cast<std::uint64_t>(i) * step);
+            make_counter(iv_, (base + static_cast<std::uint64_t>(i)) * step);
         const bytes gamma = cipher_->encrypt_block(counter);
         store_block(out, i, bs, xor_bytes(block_view(in, i, bs), gamma));
       }
     });
+    state.block_index += n;
   }
   return out;
 }
 
 cipher_context::bytes cipher_context::encrypt_blocks(
-    const bytes& plain, std::size_t& threads) const {
+    const bytes& plain, stream_state& state, std::size_t& threads) const {
   const std::size_t bs = block_size_;
   const std::size_t n = plain.size() / bs;
   bytes out(plain.size());
@@ -267,49 +327,52 @@ cipher_context::bytes cipher_context::encrypt_blocks(
       break;
 
     case cipher_mode::cbc: {  // C_i = E(P_i xor C_(i-1)), C_0 = IV
-      bytes prev = iv_;
+      bytes prev = state.prev;
       for (std::size_t i = 0; i < n; ++i) {
         bytes c =
             cipher_->encrypt_block(xor_bytes(block_view(plain, i, bs), prev));
         store_block(out, i, bs, c);
         prev = std::move(c);
       }
+      state.prev = std::move(prev);
       break;
     }
 
     case cipher_mode::
         pcbc: {  // C_i = E(P_i xor F_(i-1)), F_i = P_i xor C_i, F_0 = IV
-      bytes feedback = iv_;
+      bytes feedback = state.prev;
       for (std::size_t i = 0; i < n; ++i) {
         const bytes c = cipher_->encrypt_block(
             xor_bytes(block_view(plain, i, bs), feedback));
         store_block(out, i, bs, c);
         feedback = xor_bytes(block_view(plain, i, bs), c);
       }
+      state.prev = std::move(feedback);
       break;
     }
 
     case cipher_mode::cfb: {  // C_i = P_i xor E(C_(i-1)), C_0 = IV
-      bytes prev = iv_;
+      bytes prev = state.prev;
       for (std::size_t i = 0; i < n; ++i) {
         bytes c =
             xor_bytes(block_view(plain, i, bs), cipher_->encrypt_block(prev));
         store_block(out, i, bs, c);
         prev = std::move(c);
       }
+      state.prev = std::move(prev);
       break;
     }
 
     case cipher_mode::ofb:
     case cipher_mode::ctr:
     case cipher_mode::random_delta:
-      return stream_blocks(plain, threads);
+      return stream_blocks(plain, state, threads);
   }
   return out;
 }
 
 cipher_context::bytes cipher_context::decrypt_blocks(
-    const bytes& cipher_text, std::size_t& threads) const {
+    const bytes& cipher_text, stream_state& state, std::size_t& threads) const {
   const std::size_t bs = block_size_;
   const std::size_t n = cipher_text.size() / bs;
   bytes out(cipher_text.size());
@@ -328,43 +391,52 @@ cipher_context::bytes cipher_context::decrypt_blocks(
     case cipher_mode::cbc:  // P_i = D(C_i) xor C_(i-1); блоки независимы
       threads = parallel_for(n, [&](std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end; ++i) {
-          const bytes_view prev =
-              i == 0 ? bytes_view(iv_) : block_view(cipher_text, i - 1, bs);
+          const bytes_view prev = i == 0 ? bytes_view(state.prev)
+                                         : block_view(cipher_text, i - 1, bs);
           store_block(
               out, i, bs,
               xor_bytes(cipher_->decrypt_block(block_view(cipher_text, i, bs)),
                         prev));
         }
       });
+      if (n > 0) {
+        const bytes_view last = block_view(cipher_text, n - 1, bs);
+        state.prev.assign(last.begin(), last.end());
+      }
       break;
 
     case cipher_mode::pcbc: {  // P_i = D(C_i) xor F_(i-1), F_i = P_i xor C_i
-      bytes feedback = iv_;
+      bytes feedback = state.prev;
       for (std::size_t i = 0; i < n; ++i) {
         const bytes p = xor_bytes(
             cipher_->decrypt_block(block_view(cipher_text, i, bs)), feedback);
         store_block(out, i, bs, p);
         feedback = xor_bytes(p, block_view(cipher_text, i, bs));
       }
+      state.prev = std::move(feedback);
       break;
     }
 
     case cipher_mode::cfb:  // P_i = C_i xor E(C_(i-1)); блоки независимы
       threads = parallel_for(n, [&](std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end; ++i) {
-          const bytes_view prev =
-              i == 0 ? bytes_view(iv_) : block_view(cipher_text, i - 1, bs);
+          const bytes_view prev = i == 0 ? bytes_view(state.prev)
+                                         : block_view(cipher_text, i - 1, bs);
           store_block(out, i, bs,
                       xor_bytes(block_view(cipher_text, i, bs),
                                 cipher_->encrypt_block(prev)));
         }
       });
+      if (n > 0) {
+        const bytes_view last = block_view(cipher_text, n - 1, bs);
+        state.prev.assign(last.begin(), last.end());
+      }
       break;
 
     case cipher_mode::ofb:
     case cipher_mode::ctr:
     case cipher_mode::random_delta:
-      return stream_blocks(cipher_text, threads);
+      return stream_blocks(cipher_text, state, threads);
   }
   return out;
 }
@@ -388,14 +460,14 @@ std::future<void> cipher_context::decrypt(std::span<const std::uint8_t> data,
 std::future<void> cipher_context::encrypt(const std::filesystem::path& input,
                                           const std::filesystem::path& output) {
   return std::async(std::launch::async, [this, input, output] {
-    write_file(output, encrypt_sync(read_file(input)));
+    process_file(input, output, true);
   });
 }
 
 std::future<void> cipher_context::decrypt(const std::filesystem::path& input,
                                           const std::filesystem::path& output) {
   return std::async(std::launch::async, [this, input, output] {
-    write_file(output, decrypt_sync(read_file(input)));
+    process_file(input, output, false);
   });
 }
 

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -21,6 +22,7 @@ enum class padding_mode { zeros, ansi_x923, pkcs7, iso_10126 };
 // алгоритма, предоставляющий объектный функционал по выполнению операций
 // шифрования и дешифрования заданным ключом симметричного алгоритма с
 // поддержкой одного из режимов шифрования.
+// Файлы обрабатываются порциями по 4096 байт (целиком в память не читаются).
 class cipher_context {
  public:
   cipher_context(std::unique_ptr<i_block_cipher> cipher,
@@ -53,12 +55,25 @@ class cipher_context {
  private:
   using bytes = std::vector<std::uint8_t>;
 
+  struct stream_state {
+    bytes prev;
+    std::uint64_t block_index = 0;
+  };
+
+  [[nodiscard]] stream_state initial_state() const;
+
   bytes encrypt_sync(std::span<const std::uint8_t> data) const;
   bytes decrypt_sync(std::span<const std::uint8_t> data) const;
 
-  bytes encrypt_blocks(const bytes& plain, std::size_t& threads) const;
-  bytes decrypt_blocks(const bytes& cipher_text, std::size_t& threads) const;
-  bytes stream_blocks(const bytes& in, std::size_t& threads) const;
+  bytes encrypt_blocks(const bytes& plain, stream_state& state,
+                       std::size_t& threads) const;
+  bytes decrypt_blocks(const bytes& cipher_text, stream_state& state,
+                       std::size_t& threads) const;
+  bytes stream_blocks(const bytes& in, stream_state& state,
+                      std::size_t& threads) const;
+
+  void process_file(const std::filesystem::path& input,
+                    const std::filesystem::path& output, bool encrypting) const;
 
   std::unique_ptr<i_block_cipher> cipher_;
   cipher_mode mode_;
@@ -69,4 +84,5 @@ class cipher_context {
   mutable std::atomic<std::size_t> encrypt_threads_{1};
   mutable std::atomic<std::size_t> decrypt_threads_{1};
 };
+
 }  // namespace lab1
