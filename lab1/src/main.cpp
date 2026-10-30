@@ -250,10 +250,60 @@ bool streaming_consistency_test(const algorithm& algo, std::mt19937_64& rng) {
   }
 
   std::error_code ignored;
-  /*std::filesystem::remove(in_path, ignored);
+  std::filesystem::remove(in_path, ignored);
   std::filesystem::remove(enc_path, ignored);
-  std::filesystem::remove(dec_path, ignored);*/
+  std::filesystem::remove(dec_path, ignored);
   std::printf("  потоковая обработка (границы порций): %s\n",
+              all_ok ? "OK" : "FAIL");
+  return all_ok;
+}
+
+bool edge_case_test(const algorithm& algo, std::mt19937_64& rng) {
+  const auto tmp = std::filesystem::temp_directory_path();
+  const auto in_path = tmp / "lab1_edge.in";
+  const auto enc_path = tmp / "lab1_edge.enc";
+  const auto dec_path = tmp / "lab1_edge.dec";
+  const std::array<bytes, 3> cases = {bytes{}, bytes{0},
+                                      bytes(algo.block_size, 0)};
+
+  bool all_ok = true;
+  for (const auto& data : cases) {
+    {
+      std::ofstream out(in_path, std::ios::binary | std::ios::trunc);
+      out.write(reinterpret_cast<const char*>(data.data()),
+                static_cast<std::streamsize>(data.size()));
+    }
+    for (const auto& pad : all_paddings) {
+      for (const auto& mode : all_modes) {
+        const bytes key = random_bytes(rng, algo.key_size);
+        const bytes iv = random_bytes(rng, algo.block_size);
+        bool ok = false;
+        try {
+          auto ctx = make_context(algo, key, mode.mode, pad.padding, iv);
+          ctx->encrypt(in_path, enc_path).get();
+          ctx->decrypt(enc_path, dec_path).get();
+          const std::size_t expected_size =
+              (data.size() / algo.block_size + 1) * algo.block_size;
+          ok = read_all(enc_path).size() == expected_size &&
+               read_all(dec_path) == data;
+        } catch (const std::exception& e) {
+          std::printf("  исключение: %s\n", e.what());
+        }
+        if (!ok) {
+          std::printf(
+              "  FAIL (граничный случай): размер %zu, набивка %s, режим %s\n",
+              data.size(), pad.name, mode.name);
+          all_ok = false;
+        }
+      }
+    }
+  }
+
+  std::error_code ignored;
+  std::filesystem::remove(in_path, ignored);
+  //std::filesystem::remove(enc_path, ignored);
+  //std::filesystem::remove(dec_path, ignored);
+  std::printf("  граничные случаи (пустой файл, один нуль): %s\n",
               all_ok ? "OK" : "FAIL");
   return all_ok;
 }
@@ -297,8 +347,8 @@ bool file_test(const algorithm& algo, const std::filesystem::path& path,
   }
 
   std::error_code ignored;
-  std::filesystem::remove(encrypted_path, ignored);
-  std::filesystem::remove(decrypted_path, ignored);
+  //std::filesystem::remove(encrypted_path, ignored);
+  //std::filesystem::remove(decrypted_path, ignored);
   return all_ok;
 }
 
@@ -345,6 +395,7 @@ int main(int argc, char* argv[]) {
       ok = block_roundtrip_test(algo, rng) && ok;
       ok = random_data_test(algo, rng, test_paddings) && ok;
       ok = streaming_consistency_test(algo, rng) && ok;
+      ok = edge_case_test(algo, rng) && ok;
       for (const auto& file : files) {
         for (const auto& pad : file_paddings) {
           ok = file_test(algo, file, pad, rng) && ok;

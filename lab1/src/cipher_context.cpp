@@ -76,51 +76,64 @@ bytes make_counter(bytes_view iv, std::uint64_t offset) {
   return counter;
 }
 
-bytes pad(bytes_view data, std::size_t bs, padding_mode mode) {
+bytes pad(bytes_view data, std::size_t bs, padding_mode mode,
+          std::size_t& added) {
   bytes result(data.begin(), data.end());
-  const std::size_t rest = data.size() % bs;
-
-  if (mode == padding_mode::zeros) {
-    if (rest != 0) {
-      result.resize(data.size() + (bs - rest), 0);
-    }
-    return result;
-  }
-
   const std::size_t count =
-      bs - rest;  // от 1 до bs; если данные кратны bs, добавляется целый блок
+      bs - (data.size() %
+            bs);  // от 1 до bs; если данные кратны bs, добавляется целый блок
+  added = count;
+
   switch (mode) {
+    case padding_mode::zeros:
+      result.insert(result.end(), count, std::uint8_t{0});
+      break;
     case padding_mode::ansi_x923:
       result.insert(result.end(), count - 1, std::uint8_t{0});
+      result.push_back(static_cast<std::uint8_t>(count));
       break;
     case padding_mode::pkcs7:
-      result.insert(result.end(), count - 1, static_cast<std::uint8_t>(count));
+      result.insert(result.end(), count, static_cast<std::uint8_t>(count));
       break;
     case padding_mode::iso_10126: {
       std::random_device rd;
       for (std::size_t i = 0; i + 1 < count; ++i) {
         result.push_back(static_cast<std::uint8_t>(rd()));
       }
+      result.push_back(static_cast<std::uint8_t>(count));
       break;
     }
-    default:
-      break;
   }
-  result.push_back(static_cast<std::uint8_t>(count));
   return result;
 }
 
-bytes unpad(bytes data, std::size_t bs, padding_mode mode) {
+bytes unpad(bytes data, std::size_t bs, padding_mode mode,
+            std::size_t zeros_length) {
+  if (data.empty()) {
+    return data;
+  }
+
   if (mode == padding_mode::zeros) {
-    while (!data.empty() && data.back() == 0) {
-      data.pop_back();
+    if (zeros_length != 0) {
+      if (zeros_length > data.size()) {
+        throw std::runtime_error("unpad: invalid Zeros padding length");
+      }
+      for (std::size_t i = data.size() - zeros_length; i < data.size(); ++i) {
+        if (data[i] != 0) {
+          throw std::runtime_error("unpad: invalid Zeros padding");
+        }
+      }
+      data.resize(data.size() - zeros_length);
+    } else {
+      std::size_t removed = 0;
+      while (!data.empty() && data.back() == 0 && removed < bs) {
+        data.pop_back();
+        ++removed;
+      }
     }
     return data;
   }
 
-  if (data.empty()) {
-    throw std::runtime_error("unpad: empty data");
-  }
   const std::size_t count = data.back();
   if (count == 0 || count > bs || count > data.size()) {
     throw std::runtime_error("unpad: invalid padding");
@@ -190,13 +203,20 @@ cipher_context::stream_state cipher_context::initial_state() const {
 cipher_context::bytes cipher_context::encrypt_sync(bytes_view data) const {
   stream_state state = initial_state();
   std::size_t threads = 1;
-  bytes result =
-      encrypt_blocks(pad(data, block_size_, padding_), state, threads);
+  std::size_t added = 0;
+  const bytes padded = pad(data, block_size_, padding_, added);
+  if (padding_ == padding_mode::zeros) {
+    zeros_padding_length_ = added;
+  }
+  bytes result = encrypt_blocks(padded, state, threads);
   encrypt_threads_ = threads;
   return result;
 }
 
 cipher_context::bytes cipher_context::decrypt_sync(bytes_view data) const {
+  if (data.empty()) {
+    return {};
+  }
   if (data.size() % block_size_ != 0) {
     throw std::invalid_argument(
         "decrypt: data size is not a multiple of block size");
@@ -205,7 +225,8 @@ cipher_context::bytes cipher_context::decrypt_sync(bytes_view data) const {
   std::size_t threads = 1;
   bytes plain = decrypt_blocks(bytes(data.begin(), data.end()), state, threads);
   decrypt_threads_ = threads;
-  return unpad(std::move(plain), block_size_, padding_);
+  return unpad(std::move(plain), block_size_, padding_,
+               zeros_padding_length_.load());
 }
 
 void cipher_context::process_file(const std::filesystem::path& input,
@@ -242,9 +263,17 @@ void cipher_context::process_file(const std::filesystem::path& input,
     std::size_t threads = 1;
     bytes result;
     if (encrypting) {
-      // Набивка добавляется только к последней порции.
-      const bytes plain = last ? pad(chunk, block_size_, padding_)
-                               : bytes(chunk.begin(), chunk.end());
+      bytes plain;
+      if (last) {
+        // Набивка добавляется только к последней порции.
+        std::size_t added = 0;
+        plain = pad(chunk, block_size_, padding_, added);
+        if (padding_ == padding_mode::zeros) {
+          zeros_padding_length_ = added;
+        }
+      } else {
+        plain.assign(chunk.begin(), chunk.end());
+      }
       result = encrypt_blocks(plain, state, threads);
     } else {
       if (got % block_size_ != 0) {
@@ -254,7 +283,8 @@ void cipher_context::process_file(const std::filesystem::path& input,
       result =
           decrypt_blocks(bytes(chunk.begin(), chunk.end()), state, threads);
       if (last) {
-        result = unpad(std::move(result), block_size_, padding_);
+        result = unpad(std::move(result), block_size_, padding_,
+                       zeros_padding_length_.load());
       }
     }
 

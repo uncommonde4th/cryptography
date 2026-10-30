@@ -81,6 +81,7 @@ class cipher_context {
   std::size_t block_size_ = 0;
   bytes iv_;
   std::uint64_t delta_ = 0;
+  mutable std::atomic<std::size_t> zeros_padding_length_{0};
   mutable std::atomic<std::size_t> encrypt_threads_{1};
   mutable std::atomic<std::size_t> decrypt_threads_{1};
 };
